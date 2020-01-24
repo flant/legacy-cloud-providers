@@ -4572,7 +4572,19 @@ func (c *Cloud) findInstanceByNodeName(nodeName types.NodeName) (*ec2.Instance, 
 	}
 
 	if len(instances) == 0 {
-		return nil, nil
+		filters := []*ec2.Filter{
+			newEc2Filter("tag:Name", privateDNSName),
+			newEc2Filter("instance-state-name", aliveFilter...),
+		}
+
+		instances, err = c.describeInstances(filters)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(instances) == 0 {
+			return nil, nil
+		}
 	}
 	if len(instances) > 1 {
 		return nil, fmt.Errorf("multiple instances found for name: %s", nodeName)
