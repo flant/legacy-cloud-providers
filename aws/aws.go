@@ -46,7 +46,7 @@ import (
 	"gopkg.in/gcfg.v1"
 	"k8s.io/klog"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -57,7 +57,7 @@ import (
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/pkg/version"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/cloud-provider"
+	cloudprovider "k8s.io/cloud-provider"
 	nodehelpers "k8s.io/cloud-provider/node/helpers"
 	servicehelpers "k8s.io/cloud-provider/service/helpers"
 	cloudvolume "k8s.io/cloud-provider/volume"
@@ -4496,7 +4496,19 @@ func (c *Cloud) findInstanceByNodeName(nodeName types.NodeName) (*ec2.Instance, 
 	}
 
 	if len(instances) == 0 {
-		return nil, nil
+		filters := []*ec2.Filter{
+			newEc2Filter("tag:Name", privateDNSName),
+			newEc2Filter("instance-state-name", aliveFilter...),
+		}
+
+		instances, err = c.describeInstances(filters)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(instances) == 0 {
+			return nil, nil
+		}
 	}
 	if len(instances) > 1 {
 		return nil, fmt.Errorf("multiple instances found for name: %s", nodeName)
