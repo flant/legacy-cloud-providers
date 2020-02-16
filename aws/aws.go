@@ -4545,6 +4545,12 @@ func mapNodeNameToPrivateDNSName(nodeName types.NodeName) string {
 
 // mapInstanceToNodeName maps a EC2 instance to a k8s NodeName, by extracting the PrivateDNSName
 func mapInstanceToNodeName(i *ec2.Instance) types.NodeName {
+	for _, tag := range i.Tags {
+		if aws.StringValue(tag.Key) == "Name" {
+			return types.NodeName(aws.StringValue(tag.Value))
+		}
+	}
+
 	return types.NodeName(aws.StringValue(i.PrivateDnsName))
 }
 
