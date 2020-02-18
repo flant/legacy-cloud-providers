@@ -262,6 +262,13 @@ var backendProtocolMapping = map[string]string{
 	"tcp":   "ssl",
 }
 
+var backendProtocolToAwsEnumMapping = map[string]string{
+	"tcp":   elbv2.ProtocolEnumTcp,
+	"tls":   elbv2.ProtocolEnumTls,
+	"http":  elbv2.ProtocolEnumHttp,
+	"https": elbv2.ProtocolEnumHttps,
+}
+
 // MaxReadThenCreateRetries sets the maximum number of attempts we will make when
 // we read to see if something exists and then try to create it if we didn't find it.
 // This can fail once in a consistent system if done in parallel
@@ -3577,7 +3584,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			continue
 		}
 
-		if isNLB(annotations) {
+		if isNLB(annotations) || isNone(annotations) {
 			portMapping := nlbPortMapping{
 				FrontendPort:     int64(port.Port),
 				FrontendProtocol: string(port.Protocol),
@@ -3590,6 +3597,12 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 				HealthCheckProtocol: elbv2.ProtocolEnumTcp,
 			}
 
+			if isNone(annotations) {
+				portMapping.HealthCheckProtocol = elbv2.ProtocolEnumHttp
+				portMapping.HealthCheckPort = 10256 // ProxyHealthzPort
+				portMapping.HealthCheckPath = "/healthz"
+			}
+
 			certificateARN := annotations[ServiceAnnotationLoadBalancerCertificate]
 			if certificateARN != "" && (sslPorts == nil || sslPorts.numbers.Has(int64(port.Port)) || sslPorts.names.Has(port.Name)) {
 				portMapping.FrontendProtocol = elbv2.ProtocolEnumTls
@@ -3598,6 +3611,19 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 
 				if backendProtocol := annotations[ServiceAnnotationLoadBalancerBEProtocol]; backendProtocol == "ssl" {
 					portMapping.TrafficProtocol = elbv2.ProtocolEnumTls
+				}
+			}
+
+			if isNone(annotations) {
+				instanceProtocol := annotations[ServiceAnnotationLoadBalancerBEProtocol]
+				if instanceProtocol == "" {
+					portMapping.TrafficProtocol = backendProtocolToAwsEnumMapping["tcp"]
+				} else {
+					protocol := backendProtocolToAwsEnumMapping[instanceProtocol]
+					if protocol == "" {
+						return nil, fmt.Errorf("invalid backend protocol %s", ServiceAnnotationLoadBalancerBEProtocol)
+					}
+					portMapping.TrafficProtocol = protocol
 				}
 			}
 
@@ -3631,6 +3657,59 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		internalELB = false
 	} else if internalAnnotation != "" {
 		internalELB = true
+	}
+
+	if isNone(annotations) {
+		if path, healthCheckNodePort := servicehelpers.GetServiceHealthCheckPathPort(apiService); path != "" {
+			for i := range v2Mappings {
+				v2Mappings[i].HealthCheckPort = int64(healthCheckNodePort)
+				v2Mappings[i].HealthCheckPath = path
+				v2Mappings[i].HealthCheckProtocol = elbv2.ProtocolEnumHttp
+			}
+		}
+
+		loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, apiService)
+		serviceName := types.NamespacedName{Namespace: apiService.Namespace, Name: apiService.Name}
+
+		instanceIDs := []string{}
+		for id := range instances {
+			instanceIDs = append(instanceIDs, string(id))
+		}
+
+		// Get additional tags set by the user
+		tags := getLoadBalancerAdditionalTags(annotations)
+		// Add default tags
+		tags[TagNameKubernetesService] = serviceName.String()
+		tags = c.tagging.buildTags(ResourceLifecycleOwned, tags)
+
+		for i, mapping := range v2Mappings {
+			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
+			existingTg, err := c.describeTargetGroup(tgNameWithSuffix)
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = c.ensureTargetGroup(
+				existingTg,
+				serviceName,
+				mapping,
+				instanceIDs,
+				c.vpcID,
+				tags,
+				tgNameWithSuffix,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return &v1.LoadBalancerStatus{[]v1.LoadBalancerIngress{
+			{
+				IP:       "0.0.0.0",
+				Hostname: "none",
+			},
+		},
+		}, nil
 	}
 
 	if isNLB(annotations) {
@@ -3948,6 +4027,37 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 func (c *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, service *v1.Service) (*v1.LoadBalancerStatus, bool, error) {
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 
+	if isNone(service.Annotations) {
+		tgCount := 0
+		portCount := len(service.Spec.Ports)
+
+		for i, _ := range service.Spec.Ports {
+			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
+			tg, err := c.describeTargetGroup(tgNameWithSuffix)
+			if err != nil {
+				return nil, false, err
+			}
+
+			if tg != nil {
+				tgCount++
+			}
+		}
+
+		if tgCount == 0 {
+			return nil, false, nil
+		} else if tgCount < portCount {
+			return nil, true, nil
+		} else {
+			return &v1.LoadBalancerStatus{[]v1.LoadBalancerIngress{
+				{
+					IP:       "0.0.0.0",
+					Hostname: "none",
+				},
+			},
+			}, true, nil
+		}
+	}
+
 	if isNLB(service.Annotations) {
 		lb, err := c.describeLoadBalancerv2(loadBalancerName)
 		if err != nil {
@@ -4216,6 +4326,26 @@ func (c *Cloud) updateInstanceSecurityGroupsForLoadBalancer(lb *elb.LoadBalancer
 func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *v1.Service) error {
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 
+	if isNone(service.Annotations) {
+		for i, _ := range service.Spec.Ports {
+			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
+			tg, err := c.describeTargetGroup(tgNameWithSuffix)
+			if err != nil {
+				return err
+			}
+			if tg == nil {
+				klog.Info("Target group already deleted: ", loadBalancerName)
+			}
+
+			_, err = c.elbv2.DeleteTargetGroup(&elbv2.DeleteTargetGroupInput{TargetGroupArn: tg.TargetGroupArn})
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
 	if isNLB(service.Annotations) {
 		lb, err := c.describeLoadBalancerv2(loadBalancerName)
 		if err != nil {
@@ -4390,6 +4520,10 @@ func (c *Cloud) UpdateLoadBalancer(ctx context.Context, clusterName string, serv
 	}
 
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
+	if isNone(service.Annotations) {
+		_, err = c.EnsureLoadBalancer(ctx, clusterName, service, nodes)
+		return err
+	}
 	if isNLB(service.Annotations) {
 		lb, err := c.describeLoadBalancerv2(loadBalancerName)
 		if err != nil {
@@ -4672,4 +4806,8 @@ func getInitialAttachDetachDelay(status string) time.Duration {
 		return volumeDetachmentStatusInitialDelay
 	}
 	return volumeAttachmentStatusInitialDelay
+}
+
+func generateTgName(prefix, suffix string) string {
+	return prefix[0:32-1-len(suffix)] + "-" + suffix
 }
