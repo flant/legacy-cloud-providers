@@ -262,6 +262,13 @@ var backendProtocolMapping = map[string]string{
 	"tcp":   "ssl",
 }
 
+var backendProtocolToAwsEnumMapping = map[string]string{
+	"tcp":   elbv2.ProtocolEnumTcp,
+	"tls":   elbv2.ProtocolEnumTls,
+	"http":  elbv2.ProtocolEnumHttp,
+	"https": elbv2.ProtocolEnumHttps,
+}
+
 // MaxReadThenCreateRetries sets the maximum number of attempts we will make when
 // we read to see if something exists and then try to create it if we didn't find it.
 // This can fail once in a consistent system if done in parallel
@@ -3608,10 +3615,15 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			}
 
 			if isNone(annotations) {
-				if backendProtocol := annotations[ServiceAnnotationLoadBalancerBEProtocol]; backendProtocol == "https" {
-					portMapping.TrafficProtocol = elbv2.ProtocolEnumHttps
+				instanceProtocol := annotations[ServiceAnnotationLoadBalancerBEProtocol]
+				if instanceProtocol == "" {
+					portMapping.TrafficProtocol = backendProtocolToAwsEnumMapping["tcp"]
 				} else {
-					portMapping.TrafficProtocol = elbv2.ProtocolEnumHttp
+					protocol := backendProtocolToAwsEnumMapping[instanceProtocol]
+					if protocol == "" {
+						return nil, fmt.Errorf("invalid backend protocol %s", ServiceAnnotationLoadBalancerBEProtocol)
+					}
+					portMapping.TrafficProtocol = protocol
 				}
 			}
 
