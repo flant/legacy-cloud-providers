@@ -121,21 +121,18 @@ func getLoadBalancerAdditionalTags(annotations map[string]string) map[string]str
 }
 
 func (c *Cloud) describeTargetGroup(tgName string) (*elbv2.TargetGroup, error) {
-	request := &elbv2.DescribeTargetGroupsInput{
-		Names: []*string{aws.String(tgName)},
-	}
-
-	response, err := c.elbv2.DescribeTargetGroups(request)
+	response, err := c.elbv2.DescribeTargetGroups(&elbv2.DescribeTargetGroupsInput{})
 	if err != nil {
-		if awsError, ok := err.(awserr.Error); ok {
-			if awsError.Code() == elbv2.ErrCodeTargetGroupNotFoundException {
-				return nil, nil
-			}
-		}
-		return nil, fmt.Errorf("error describing target group: %q", err)
+		return nil, fmt.Errorf("error describing target groups: %q", err)
 	}
 
-	return response.TargetGroups[0], nil
+	for _, tg := range response.TargetGroups {
+		if *tg.TargetGroupName == tgName {
+			return tg, nil
+		}
+	}
+
+	return nil, nil
 }
 
 // ensureLoadBalancerv2 ensures a v2 load balancer is created

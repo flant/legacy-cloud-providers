@@ -3679,7 +3679,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			return nil, fmt.Errorf("could not find any suitable subnets for creating the ELB")
 		}
 
-		tgName := c.GetLoadBalancerName(ctx, clusterName, apiService)
+		loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, apiService)
 		serviceName := types.NamespacedName{Namespace: apiService.Namespace, Name: apiService.Name}
 
 		instanceIDs := []string{}
@@ -3687,20 +3687,21 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			instanceIDs = append(instanceIDs, string(id))
 		}
 
-		existingTg, err := c.describeTargetGroup(tgName)
-		if err != nil {
-			return nil, err
-		}
+		for i, mapping := range v2Mappings {
+			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
+			existingTg, err := c.describeTargetGroup(tgNameWithSuffix)
+			if err != nil {
+				return nil, err
+			}
 
-		for _, mapping := range v2Mappings {
-			_, err := c.ensureTargetGroup(
+			_, err = c.ensureTargetGroup(
 				existingTg,
 				serviceName,
 				mapping,
 				instanceIDs,
 				c.vpcID,
 				nil,
-				tgName,
+				tgNameWithSuffix,
 			)
 			if err != nil {
 				return nil, err
@@ -4032,14 +4033,34 @@ func (c *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, service
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 
 	if isNone(service.Annotations) {
-		tg, err := c.describeTargetGroup(loadBalancerName)
-		if err != nil {
-			return nil, false, err
+		tgCount := 0
+		portCount := len(service.Spec.Ports)
+
+		for i, _ := range service.Spec.Ports {
+			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
+			tg, err := c.describeTargetGroup(tgNameWithSuffix)
+			if err != nil {
+				return nil, false, err
+			}
+
+			if tg != nil {
+				tgCount++
+			}
 		}
-		if tg == nil {
+
+		if tgCount == 0 {
 			return nil, false, nil
+		} else if tgCount < portCount {
+			return nil, true, nil
+		} else {
+			return &v1.LoadBalancerStatus{[]v1.LoadBalancerIngress{
+				{
+					IP:       "0.0.0.0",
+					Hostname: "none",
+				},
+			},
+			}, true, nil
 		}
-		return &v1.LoadBalancerStatus{}, true, nil
 	}
 
 	if isNLB(service.Annotations) {
@@ -4311,19 +4332,23 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 
 	if isNone(service.Annotations) {
-		tg, err := c.describeTargetGroup(loadBalancerName)
-		if err != nil {
-			return err
-		}
-		if tg == nil {
-			klog.Info("Target group already deleted: ", loadBalancerName)
-			return nil
+		for i, _ := range service.Spec.Ports {
+			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
+			tg, err := c.describeTargetGroup(tgNameWithSuffix)
+			if err != nil {
+				return err
+			}
+			if tg == nil {
+				klog.Info("Target group already deleted: ", loadBalancerName)
+			}
+
+			_, err = c.elbv2.DeleteTargetGroup(&elbv2.DeleteTargetGroupInput{TargetGroupArn: tg.TargetGroupArn})
+			if err != nil {
+				return err
+			}
 		}
 
-		_, err = c.elbv2.DeleteTargetGroup(&elbv2.DeleteTargetGroupInput{TargetGroupArn: tg.TargetGroupArn})
-		if err != nil {
-			return err
-		}
+		return nil
 	}
 
 	if isNLB(service.Annotations) {
@@ -4501,13 +4526,6 @@ func (c *Cloud) UpdateLoadBalancer(ctx context.Context, clusterName string, serv
 
 	loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, service)
 	if isNone(service.Annotations) {
-		tg, err := c.describeTargetGroup(loadBalancerName)
-		if err != nil {
-			return err
-		}
-		if tg == nil {
-			return fmt.Errorf("Target group not found")
-		}
 		_, err = c.EnsureLoadBalancer(ctx, clusterName, service, nodes)
 		return err
 	}
@@ -4793,4 +4811,8 @@ func getInitialAttachDetachDelay(status string) time.Duration {
 		return volumeDetachmentStatusInitialDelay
 	}
 	return volumeAttachmentStatusInitialDelay
+}
+
+func generateTgName(prefix, suffix string) string {
+	return prefix[0:32-1-len(suffix)] + "-" + suffix
 }
