@@ -3668,17 +3668,6 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			}
 		}
 
-		// Find the subnets that the ELB will live in
-		subnetIDs, err := c.findELBSubnets(internalELB)
-		if err != nil {
-			klog.Errorf("Error listing subnets in VPC: %q", err)
-			return nil, err
-		}
-		// Bail out early if there are no subnets
-		if len(subnetIDs) == 0 {
-			return nil, fmt.Errorf("could not find any suitable subnets for creating the ELB")
-		}
-
 		loadBalancerName := c.GetLoadBalancerName(ctx, clusterName, apiService)
 		serviceName := types.NamespacedName{Namespace: apiService.Namespace, Name: apiService.Name}
 
@@ -3686,6 +3675,12 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		for id := range instances {
 			instanceIDs = append(instanceIDs, string(id))
 		}
+
+		// Get additional tags set by the user
+		tags := getLoadBalancerAdditionalTags(annotations)
+		// Add default tags
+		tags[TagNameKubernetesService] = serviceName.String()
+		tags = c.tagging.buildTags(ResourceLifecycleOwned, tags)
 
 		for i, mapping := range v2Mappings {
 			tgNameWithSuffix := generateTgName(loadBalancerName, strconv.Itoa(i))
@@ -3700,7 +3695,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 				mapping,
 				instanceIDs,
 				c.vpcID,
-				nil,
+				tags,
 				tgNameWithSuffix,
 			)
 			if err != nil {
